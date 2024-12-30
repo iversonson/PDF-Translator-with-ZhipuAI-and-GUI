@@ -1,0 +1,263 @@
+import fitz  # PyMuPDF
+from zhipuai import ZhipuAI
+import re
+import os
+import tkinter as tk
+from tkinter import scrolledtext, messagebox, simpledialog, Button
+import threading
+
+# 设置 ZhipuAI API 密钥 (请替换成你自己的 API 密钥)
+client = ZhipuAI(api_key="******")  # 替换成你的 API 密钥
+
+# 全局变量，用于控制翻译过程
+stop_translation = False
+
+def translate_with_zhipuai(text, model="glm-4-flash"):
+    """
+    使用 ZhipuAI API 翻译文本。
+
+    Args:
+        text: 要翻译的文本。
+        model: 使用的 ZhipuAI 模型。
+
+    Returns:
+        翻译后的文本。
+    """
+    if not text:
+        return ""
+    try:
+        messages = [
+            {"role": "system", "content": "你是一个专业翻译助手，负责将英文翻译为中文。"},
+            {"role": "user", "content": text}
+        ]
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            top_p=0.7,
+            temperature=0.95,
+            max_tokens=2048,
+            stream=False
+        )
+        translation = response.choices[0].message.content.strip()
+        return translation
+    except Exception as e:
+        print(f"ZhipuAI API 错误: {e}")
+        print(f"原文: {text}")
+        return "翻译失败"
+
+def preprocess_text(text):
+    """
+    预处理文本：移除多余换行和空格。
+    """
+    text = text.replace('\n', ' ')
+    text = re.sub(r'(?<!\.)\s+', ' ', text)  # 移除多余空格，句号后保留一个空格
+    return text
+
+def refine_text_with_zhipuai(original_text, translated_text, model="glm-4-flash"):
+    """
+    使用 ZhipuAI API 润色和整合文本。
+
+    Args:
+        original_text: 原始英文文本。
+        translated_text: 翻译后的中文文本。
+        model: 使用的 ZhipuAI 模型。
+
+    Returns:
+        润色整合后的文本，格式为 "英文\n中文"。
+    """
+    try:
+        prompt = f"""
+        你是一个专业的翻译润色助手，请你结合下面的英文内容和中文翻译内容，润色并整理成一段通顺、准确、符合中文表达习惯的文本。
+
+        请按照以下格式输出：
+        英文原文
+        中文翻译
+
+        ---
+        英文原文：
+        {original_text}
+        ---
+        中文翻译：
+        {translated_text}
+        ---
+        """
+        messages = [
+            {"role": "system", "content": "你是一个专业翻译助手，负责将英文翻译为中文并润色。"},
+            {"role": "user", "content": prompt}
+        ]
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            top_p=0.7,
+            temperature=0.95,
+            max_tokens=2048,
+            stream=False
+        )
+        refined_text = response.choices[0].message.content.strip()
+        # 提取英文和中文部分, 使用正则表达式提取
+        refined_text = re.sub(r"英文原文：", "", refined_text)
+        refined_text = re.sub(r"中文翻译：", "", refined_text)
+        return refined_text
+    except Exception as e:
+        print(f"ZhipuAI API 润色错误: {e}")
+        return f"润色失败：{e}\n\n原文:\n{original_text}\n\n翻译:\n{translated_text}"
+
+def translate_pdf_and_update_gui(pdf_path, text_area, progress_label, stop_button):
+    global stop_translation
+    stop_translation = False
+    stop_button.config(state="normal")
+    txt_output_path = pdf_path.replace(".pdf", ".txt")
+
+    try:
+        doc = fitz.open(pdf_path)
+
+        # Check if the PDF is encrypted
+        if doc.needs_pass:
+            password = simpledialog.askstring("Password", "This PDF is password-protected. Please enter the password:", show='*')
+            if not doc.authenticate(password):
+                messagebox.showerror("Error", "Incorrect password!")
+                return
+
+        output_path = pdf_path.replace(".pdf", "翻译.pdf")
+        temp_output_path = output_path.replace(".pdf", "_temp.pdf")
+        total_pages = len(doc)
+
+        temp_doc = fitz.open()  # Create temp_doc outside the if/else
+        temp_doc.set_metadata(doc.metadata)
+        start_page = 0
+        # 尝试打开临时文件，如果存在则继续翻译
+        if os.path.exists(temp_output_path):
+            try:
+                with fitz.open(temp_output_path) as existing_temp_doc:
+                    start_page = len(existing_temp_doc)
+                    # copy pages from existing temp file into the new temp file
+                    temp_doc.insert_pdf(existing_temp_doc)
+            except Exception as e:
+                print(f"Error opening or copying from existing temp file: {e}")
+                start_page = 0
+
+        # 用于存储润色后的文本块，每三个文本块为一组
+        refined_blocks = []
+        all_refined_text = ""
+
+        for page_num in range(start_page, total_pages):
+            if stop_translation:
+                break
+            page = doc[page_num]
+            temp_page = temp_doc.new_page(width=page.rect.width, height=page.rect.height)
+
+            temp_page.show_pdf_page(temp_page.rect, doc, page_num)
+            blocks = page.get_text("blocks")
+            total_blocks = len(blocks)
+
+            for block_num, b in enumerate(blocks):
+                if stop_translation:
+                    break
+                if b[6] == 0:
+                    text = b[4]
+                    text = preprocess_text(text)
+                    if text.strip():
+                        translation = translate_with_zhipuai(text, model="glm-4-flash")
+
+                        # 更新 GUI
+                        text_area.insert(tk.END, f"页码: {page_num + 1}/{total_pages}, 文本块: {block_num + 1}/{total_blocks}\n")
+                        text_area.insert(tk.END, f"原文: {text}\n")
+                        text_area.insert(tk.END, f"翻译: {translation}\n")
+                        text_area.insert(tk.END, "-" * 20 + "\n")
+                        text_area.see(tk.END)
+
+                        progress_label.config(text=f"进度: 页码 {page_num + 1}/{total_pages}, 文本块 {block_num + 1}/{total_blocks}")
+
+                        tw = fitz.TextWriter(temp_page.rect)
+                        font = fitz.Font("cjk")
+                        tw.append((b[0], b[3] + 15), translation, font=font, fontsize=11)
+                        tw.write_text(temp_page)
+
+                        # 将原文和翻译添加到 refined_blocks
+                        refined_blocks.append((text, translation))
+
+                        # 每三个文本块进行一次润色
+                        if len(refined_blocks) == 3:
+                            original_text_block = "\n".join([b[0] for b in refined_blocks])
+                            translated_text_block = "\n".join([b[1] for b in refined_blocks])
+                            refined_text = refine_text_with_zhipuai(original_text_block, translated_text_block)
+                            all_refined_text += refined_text + "\n\n"
+                            refined_blocks = []  # 清空
+
+            temp_doc.save(temp_output_path)
+
+        # 处理剩余不足三个的文本块
+        if refined_blocks:
+            original_text_block = "\n".join([b[0] for b in refined_blocks])
+            translated_text_block = "\n".join([b[1] for b in refined_blocks])
+            refined_text = refine_text_with_zhipuai(original_text_block, translated_text_block)
+            all_refined_text += refined_text + "\n\n"
+
+        # 保存最终润色后的文本到 TXT 文件
+        with open(txt_output_path, "w", encoding="utf-8") as txt_file:
+            txt_file.write(all_refined_text)
+
+        if stop_translation:
+            messagebox.showinfo("提示", f"翻译已暂停，当前进度已保存至: {temp_output_path}\n润色后的文本已保存至: {txt_output_path}")
+        else:
+            temp_doc.save(output_path)
+            temp_doc.close()
+            os.remove(temp_output_path)
+            messagebox.showinfo("完成", f"翻译完成，已保存至: {output_path}\n润色后的文本已保存至: {txt_output_path}")
+
+        stop_button.config(state="disabled")
+
+    except FileNotFoundError:
+        messagebox.showerror("错误", f"未找到文件 '{pdf_path}'")
+    except Exception as e:
+        messagebox.showerror("错误", f"处理 PDF 时发生错误: {e}")
+
+def start_translation(text_area, progress_label, stop_button):
+    """
+    开始翻译的线程函数。
+    """
+    pdf_filename = simpledialog.askstring("输入", "请输入要翻译的 PDF 文件名（在当前目录下）:")
+    if pdf_filename:
+        if not pdf_filename.endswith(".pdf"):
+            pdf_filename += ".pdf"
+        pdf_path = os.path.join(os.getcwd(), pdf_filename)
+
+        # 清空文本框
+        text_area.delete('1.0', tk.END)
+
+        # 在单独的线程中运行翻译，避免阻塞 GUI
+        thread = threading.Thread(target=translate_pdf_and_update_gui, args=(pdf_path, text_area, progress_label, stop_button))
+        thread.start()
+
+def stop_translation_func():
+    """
+    停止翻译的函数。
+    """
+    global stop_translation
+    stop_translation = True
+
+def main():
+    # 创建主窗口
+    root = tk.Tk()
+    root.title("PDF 翻译工具")
+
+    # 翻译按钮
+    translate_button = Button(root, text="翻译 PDF", command=lambda: start_translation(text_area, progress_label, stop_button))
+    translate_button.pack(pady=10)
+
+    # 停止按钮
+    stop_button = Button(root, text="停止翻译", command=stop_translation_func, state="disabled")
+    stop_button.pack(pady=5)
+
+    # 进度标签
+    progress_label = tk.Label(root, text="进度: -")
+    progress_label.pack()
+
+    # 显示翻译结果的文本框
+    text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD)
+    text_area.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
